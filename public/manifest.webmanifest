@@ -1,0 +1,16 @@
+{
+  "name": "Open Guitar Tuner",
+  "short_name": "Tuner",
+  "description": "A mobile-first open-source guitar tuner with microphone input, alternate tunings, and string detection.",
+  "display": "standalone",
+  "background_color": "#081118",
+  "theme_color": "#081118",
+  "start_url": "./",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
