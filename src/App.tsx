@@ -657,7 +657,9 @@ function groupTunings(tunings: TuningDefinition[], favoriteIds: string[]) {
   const grouped = [...categories.entries()].sort((left, right) => left[0].localeCompare(right[0]));
 
   return favorites.length > 0
-    ? [["Favorites", favorites], ...grouped.filter(([group]) => group !== "Favorites")]
+    ? ([["Favorites", favorites], ...grouped.filter(([group]) => group !== "Favorites")] as Array<
+        [string, TuningDefinition[]]
+      >)
     : grouped;
 }
 
