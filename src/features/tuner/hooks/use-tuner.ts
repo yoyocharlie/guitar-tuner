@@ -7,8 +7,8 @@ import {
   describeFrequency,
   frequencyToMidi,
   median,
-} from "./music";
-import type { TuningDefinition } from "./tunings";
+} from "@/features/tuner/lib/music";
+import type { TuningDefinition } from "@/features/tuner/lib/tunings";
 
 export type MicState = "idle" | "requesting" | "listening" | "denied" | "unsupported" | "error";
 
@@ -72,11 +72,49 @@ export function useTuner(options: UseTunerOptions) {
     () => buildTargets(options.tuning.notes, options.calibration),
     [options.calibration, options.tuning.notes],
   );
+  const runtimeRef = useRef({
+    autoDetect: options.autoDetect,
+    calibration: options.calibration,
+    noiseSensitivity: options.noiseSensitivity,
+    resetToken: "",
+    selectedStringIndex: options.selectedStringIndex,
+    targets,
+  });
+
+  useEffect(() => {
+    runtimeRef.current = {
+      autoDetect: options.autoDetect,
+      calibration: options.calibration,
+      noiseSensitivity: options.noiseSensitivity,
+      resetToken: [
+        options.tuning.id,
+        options.calibration,
+        options.autoDetect,
+        options.selectedStringIndex ?? "auto",
+        targets.map((target) => target.note).join(","),
+      ].join("::"),
+      selectedStringIndex: options.selectedStringIndex,
+      targets,
+    };
+  }, [
+    options.autoDetect,
+    options.calibration,
+    options.noiseSensitivity,
+    options.selectedStringIndex,
+    options.tuning.id,
+    targets,
+  ]);
 
   useEffect(() => {
     setSnapshot(INITIAL_SNAPSHOT);
     lockRef.current = null;
-  }, [options.autoDetect, options.selectedStringIndex, options.tuning.id, targets]);
+  }, [
+    options.autoDetect,
+    options.calibration,
+    options.selectedStringIndex,
+    options.tuning.id,
+    targets,
+  ]);
 
   useEffect(() => {
     if (!enabled) {
@@ -94,19 +132,32 @@ export function useTuner(options: UseTunerOptions) {
     let disposed = false;
     let stream: MediaStream | null = null;
 
-    const timeDomain = new Float32Array(4096);
+    const timeDomain = new Float32Array(8192);
     const pitchFrames: PitchFrame[] = [];
     const targetFrames: number[] = [];
     const centsFrames: number[] = [];
     const history: number[] = [];
-
-    const minClarity = 0.62 + options.noiseSensitivity * 0.0023;
-    const minVolume = 0.008 + options.noiseSensitivity * 0.00008;
+    let lastResetToken = runtimeRef.current.resetToken;
 
     const tick = () => {
       if (disposed || !analyser || !audioContext) {
         return;
       }
+
+      const runtime = runtimeRef.current;
+
+      if (runtime.resetToken !== lastResetToken) {
+        pitchFrames.length = 0;
+        targetFrames.length = 0;
+        centsFrames.length = 0;
+        history.length = 0;
+        lockRef.current = null;
+        lastResetToken = runtime.resetToken;
+      }
+
+      const noiseRatio = runtime.noiseSensitivity / 100;
+      const minClarity = 0.3 + noiseRatio * 0.18;
+      const minVolume = 0.0012 + noiseRatio * 0.0028;
 
       analyser.getFloatTimeDomainData(timeDomain);
       const volume = getVolume(timeDomain);
@@ -127,10 +178,10 @@ export function useTuner(options: UseTunerOptions) {
       const clarity =
         pitchFrames.length > 0 ? average(pitchFrames.map((frame) => frame.clarity)) : 0;
 
-      let targetIndex = options.selectedStringIndex;
+      let targetIndex = runtime.selectedStringIndex;
 
-      if (smoothedFrequency !== null && (options.autoDetect || targetIndex === null)) {
-        const closestIndex = getClosestTargetIndex(smoothedFrequency, targets);
+      if (smoothedFrequency !== null && (runtime.autoDetect || targetIndex === null)) {
+        const closestIndex = getClosestTargetIndex(smoothedFrequency, runtime.targets);
 
         if (closestIndex !== null) {
           targetFrames.push(closestIndex);
@@ -144,11 +195,11 @@ export function useTuner(options: UseTunerOptions) {
         }
       }
 
-      const target = targetIndex === null ? null : targets[targetIndex];
+      const target = targetIndex === null ? null : runtime.targets[targetIndex];
       const note =
         smoothedFrequency === null
           ? null
-          : describeFrequency(smoothedFrequency, options.calibration);
+          : describeFrequency(smoothedFrequency, runtime.calibration);
       const cents =
         smoothedFrequency !== null && target
           ? centsBetween(smoothedFrequency, target.frequency)
@@ -183,7 +234,7 @@ export function useTuner(options: UseTunerOptions) {
       }
 
       const statusText = getStatusText({
-        autoDetect: options.autoDetect,
+        autoDetect: runtime.autoDetect,
         clarity,
         cents,
         locked,
@@ -215,9 +266,11 @@ export function useTuner(options: UseTunerOptions) {
         setMicState("requesting");
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            autoGainControl: false,
-            echoCancellation: false,
-            noiseSuppression: false,
+            // Let the browser lift weak built-in mic input before our pitch gate runs.
+            autoGainControl: true,
+            // Built-in device processing helps weak mobile/laptop mics more than it hurts.
+            echoCancellation: true,
+            noiseSuppression: true,
           },
         });
 
@@ -255,15 +308,7 @@ export function useTuner(options: UseTunerOptions) {
       stream?.getTracks().forEach((track) => track.stop());
       audioContext?.close().catch(() => undefined);
     };
-  }, [
-    enabled,
-    lockHandler,
-    options.autoDetect,
-    options.calibration,
-    options.noiseSensitivity,
-    options.selectedStringIndex,
-    targets,
-  ]);
+  }, [enabled]);
 
   const enableMic = () => {
     setEnabled(true);
@@ -295,9 +340,10 @@ function getVolume(buffer: Float32Array) {
   return Math.sqrt(sum / buffer.length);
 }
 
-function detectPitch(buffer: Float32Array, sampleRate: number): DetectedPitch | null {
+export function detectPitch(buffer: Float32Array, sampleRate: number): DetectedPitch | null {
   const size = buffer.length;
   const difference = new Float32Array(size);
+  const cumulativeMean = new Float32Array(size);
 
   for (let tau = 1; tau < size; tau += 1) {
     let sum = 0;
@@ -308,20 +354,34 @@ function detectPitch(buffer: Float32Array, sampleRate: number): DetectedPitch | 
     difference[tau] = sum;
   }
 
+  cumulativeMean[0] = 1;
   let runningTotal = 0;
-  let bestTau = -1;
-  let bestScore = 1;
-
-  for (let tau = 2; tau < size; tau += 1) {
+  for (let tau = 1; tau < size; tau += 1) {
     runningTotal += difference[tau];
-    if (runningTotal === 0) {
-      continue;
-    }
+    cumulativeMean[tau] = runningTotal === 0 ? 1 : (difference[tau] * tau) / runningTotal;
+  }
 
-    const normalized = (difference[tau] * tau) / runningTotal;
-    if (normalized < bestScore) {
-      bestScore = normalized;
-      bestTau = tau;
+  const absoluteThreshold = 0.18;
+  let bestTau = -1;
+
+  for (let tau = 2; tau < size - 1; tau += 1) {
+    if (cumulativeMean[tau] < absoluteThreshold) {
+      let candidate = tau;
+      while (candidate + 1 < size && cumulativeMean[candidate + 1] < cumulativeMean[candidate]) {
+        candidate += 1;
+      }
+      bestTau = candidate;
+      break;
+    }
+  }
+
+  if (bestTau === -1) {
+    let bestScore = 1;
+    for (let tau = 2; tau < size; tau += 1) {
+      if (cumulativeMean[tau] < bestScore) {
+        bestScore = cumulativeMean[tau];
+        bestTau = tau;
+      }
     }
   }
 
@@ -329,19 +389,37 @@ function detectPitch(buffer: Float32Array, sampleRate: number): DetectedPitch | 
     return null;
   }
 
-  const frequency = sampleRate / bestTau;
+  const refinedTau = parabolicInterpolation(cumulativeMean, bestTau);
+  const frequency = sampleRate / refinedTau;
 
   if (frequency < 30 || frequency > 1200) {
     return null;
   }
 
-  const clarity = clamp(1 - bestScore, 0, 1);
+  const clarity = clamp(1 - cumulativeMean[bestTau], 0, 1);
 
-  if (clarity < 0.45) {
+  if (clarity < 0.22) {
     return null;
   }
 
   return { frequency, clarity };
+}
+
+function parabolicInterpolation(values: Float32Array, tau: number) {
+  const left = values[tau - 1];
+  const center = values[tau];
+  const right = values[tau + 1];
+
+  if (left === undefined || center === undefined || right === undefined) {
+    return tau;
+  }
+
+  const denominator = left - 2 * center + right;
+  if (Math.abs(denominator) < 1e-7) {
+    return tau;
+  }
+
+  return tau + (left - right) / (2 * denominator);
 }
 
 function getClosestTargetIndex(frequency: number, targets: Array<{ midi: number }>) {
@@ -394,11 +472,11 @@ function getStatusText(input: {
   }
 
   if (input.tooNoisy) {
-    return "Too noisy. Mute other strings and pluck once.";
+    return "Too noisy. Mute other strings.";
   }
 
   if (input.locked && input.targetNote) {
-    return `${input.targetNote} locked in`;
+    return `${input.targetNote} locked`;
   }
 
   if (input.cents === null) {
